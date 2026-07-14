@@ -438,11 +438,11 @@ private const val HTTP_TOO_MANY_REQUESTS = 429
 // the limit again exactly at the boundary.
 private const val RATE_LIMIT_RETRY_MARGIN_MS = 1000L
 
-// Cap on how many times a single request will wait out Telegram's retry_after
-// before giving up. Honoring retry_after recovers from a transient 429, but a
-// bot that is persistently over the limit (e.g. a busy chat exceeding Telegram's
-// per-group message rate) would otherwise retry forever and wedge the caller, so
-// past this cap we fail the request instead (dropping the message, as before).
+// Cap on how many rate-limit (HTTP 429) rounds [withBotFailover] waits out before
+// giving up and dropping the message. Honoring Telegram's retry_after recovers from
+// a transient 429, but if every bot is persistently over the limit we must not retry
+// forever (that would wedge the send queue), so past this cap we drop -- as the code
+// did before retry_after was honored at all.
 internal const val MAX_RATE_LIMIT_RETRIES = 5
 
 /**
@@ -466,40 +466,15 @@ internal suspend fun <T> withRetry(
     operation: suspend () -> T,
 ): T {
     var attempt = 0
-    var rateLimitRetries = 0
     val infiniteRetries = maxAttempts <= 0
 
     while (true) {
         try {
             return operation()
         } catch (e: Exception) {
-            // Telegram explicitly told us how long to wait (HTTP 429): honor that
-            // instead of using exponential backoff, and don't spend the connection
-            // retry budget on it — rate limiting is not a connection failure.
-            val rateLimitDelay = rateLimitDelayMs(e)
-            if (rateLimitDelay != null) {
-                rateLimitRetries++
-                // Honoring retry_after recovers from a transient 429, but retrying
-                // forever would wedge the caller when the bot is persistently over
-                // the limit, so give up (fail the request) once the cap is reached.
-                if (rateLimitRetries > MAX_RATE_LIMIT_RETRIES) {
-                    logger.error(
-                        "Still rate limited by Telegram after $MAX_RATE_LIMIT_RETRIES retries, giving up",
-                        e,
-                    )
-                    throw e
-                }
-                // Honor retry_after exactly: it must not be clamped to maxDelay
-                // (which only bounds connection backoff). Retrying before the
-                // server-mandated interval would just trigger another 429.
-                logger.warn(
-                    "Rate limited by Telegram, retrying in ${rateLimitDelay / 1000} seconds " +
-                        "(retry $rateLimitRetries/$MAX_RATE_LIMIT_RETRIES)"
-                )
-                delay(rateLimitDelay)
-                continue
-            }
-
+            // Rate limiting (HTTP 429 -> TelegramException) is intentionally NOT retried
+            // here: it is thrown so the caller ([withBotFailover]) can try a reserve bot
+            // before spending time waiting out Telegram's retry_after.
             if (!retryExceptions.contains(e::class)) {
                 logger.error("Not retriable exception", e)
                 throw e
@@ -516,6 +491,53 @@ internal suspend fun <T> withRetry(
             logger.warn("Operation failed ($attemptText), retrying in ${delay / 1000} seconds: ${e.javaClass.canonicalName}: ${e.message}")
             delay(delay)
         }
+    }
+}
+
+/**
+ * Runs [send] against each bot in [bots] in order (main bot first, then reserves),
+ * providing rate-limit failover: if a bot replies with HTTP 429, the next bot is tried
+ * immediately under its own separate limit. Only when *every* bot is rate-limited do we
+ * wait out Telegram's retry_after and retry the whole set, up to [maxRateLimitRetries]
+ * rounds, after which the last rate-limit error is thrown (i.e. the message is dropped).
+ *
+ * With a single bot this degrades to "honor retry_after, capped, then give up".
+ * Non-rate-limit [TelegramException]s (and any other exception) propagate immediately.
+ */
+internal suspend fun <B, T> withBotFailover(
+    bots: List<B>,
+    logger: ILogger,
+    maxRateLimitRetries: Int = MAX_RATE_LIMIT_RETRIES,
+    send: suspend (B) -> T,
+): T {
+    require(bots.isNotEmpty()) { "withBotFailover needs at least one bot" }
+    var rateLimitRounds = 0
+    while (true) {
+        var lastRateLimit: TelegramException? = null
+        for (bot in bots) {
+            try {
+                return send(bot)
+            } catch (e: TelegramException) {
+                if (rateLimitDelayMs(e) == null) throw e
+                // This bot is rate limited right now -- try the next one immediately.
+                lastRateLimit = e
+            }
+        }
+        // Every bot is currently rate limited.
+        rateLimitRounds++
+        val delay = rateLimitDelayMs(lastRateLimit!!)!!
+        if (rateLimitRounds > maxRateLimitRetries) {
+            logger.error(
+                "All ${bots.size} bot(s) still rate limited by Telegram after $maxRateLimitRetries retries, dropping message",
+                lastRateLimit,
+            )
+            throw lastRateLimit
+        }
+        logger.warn(
+            "All ${bots.size} bot(s) rate limited by Telegram, retrying in ${delay / 1000} seconds " +
+                "(retry $rateLimitRounds/$maxRateLimitRetries)"
+        )
+        delay(delay)
     }
 }
 

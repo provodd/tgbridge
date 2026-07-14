@@ -22,9 +22,12 @@ abstract class MessageContent {
      * @param lastMessage The return value of the last [send] call for the same chat.
      * This value is reset when any Telegram message for the respective chat is received.
      * It can also be reset by calling [ChatManager.clearLastMessage].
+     * @param bot The bot to send new messages with (may be a reserve bot during rate-limit
+     * failover). Edits/deletes must target [TgbridgeTgMessage.bot] of [lastMessage]; when [bot]
+     * differs from it (i.e. a reserve took over), a new message must be sent instead of merging.
      * @return The [TgbridgeTgMessage] object representing the sent message, or null. This value will be used in subsequent [send] calls
      */
-    abstract suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?): TgbridgeTgMessage?
+    abstract suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?, bot: TelegramBot): TgbridgeTgMessage?
 }
 
 class MessageContentText(
@@ -56,8 +59,8 @@ class MessageContentText(
         disableNotification = false
     )
 
-    override suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?): TgbridgeTgMessage {
-        val tgMessage = TelegramBridge.INSTANCE.bot.sendMessage(
+    override suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?, bot: TelegramBot): TgbridgeTgMessage {
+        val tgMessage = bot.sendMessage(
             chat.chatId,
             text.text,
             text.entities,
@@ -65,7 +68,7 @@ class MessageContentText(
             disableNotification = disableNotification,
         )
         return TgbridgeTgMessage(
-            chat, tgMessage.messageId, Clock.systemUTC().instant(), this
+            chat, tgMessage.messageId, Clock.systemUTC().instant(), this, bot
         )
     }
 }
@@ -83,8 +86,8 @@ class MessageContentHTMLText(
         disableNotification = false
     )
 
-    override suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?): TgbridgeTgMessage {
-        val tgMessage = TelegramBridge.INSTANCE.bot.sendMessage(
+    override suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?, bot: TelegramBot): TgbridgeTgMessage {
+        val tgMessage = bot.sendMessage(
             chat.chatId,
             text,
             parseMode = "HTML",
@@ -92,7 +95,7 @@ class MessageContentHTMLText(
             disableNotification = disableNotification,
         )
         return TgbridgeTgMessage(
-            chat, tgMessage.messageId, Clock.systemUTC().instant(), this
+            chat, tgMessage.messageId, Clock.systemUTC().instant(), this, bot
         )
     }
 }
@@ -112,8 +115,8 @@ class MessageContentMergeableText(
     @Deprecated("This constructor is deprecated", level = DeprecationLevel.HIDDEN)
     constructor(text: Component) : this(text, disableNotification = false)
 
-    private suspend fun sendNewMessage(chat: ChatConfig): TgbridgeTgMessage {
-        val tgMessage = TelegramBridge.INSTANCE.bot.sendMessage(
+    private suspend fun sendNewMessage(chat: ChatConfig, bot: TelegramBot): TgbridgeTgMessage {
+        val tgMessage = bot.sendMessage(
             chat.chatId,
             text.text,
             text.entities,
@@ -121,22 +124,24 @@ class MessageContentMergeableText(
             disableNotification = disableNotification,
         )
         return TgbridgeTgMessage(
-            chat, tgMessage.messageId, Clock.systemUTC().instant(), this
+            chat, tgMessage.messageId, Clock.systemUTC().instant(), this, bot
         )
     }
 
-    override suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?): TgbridgeTgMessage {
-        val prevContent = (lastMessage?.content as? MessageContentMergeableText) ?: return sendNewMessage(chat)
+    override suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?, bot: TelegramBot): TgbridgeTgMessage {
+        val prevContent = (lastMessage?.content as? MessageContentMergeableText) ?: return sendNewMessage(chat, bot)
         val currDate = Clock.systemUTC().instant()
         if (
-            (prevContent.text + "\n" + text).text.length > 4000
+            // can only edit a message the current bot sent -- on failover to a reserve bot, start fresh
+            lastMessage.bot !== bot
+            || (prevContent.text + "\n" + text).text.length > 4000
             || currDate.minus((config.messages.mergeWindow).toLong(), ChronoUnit.SECONDS) > lastMessage.date
         ) {
-            return sendNewMessage(chat)
+            return sendNewMessage(chat, bot)
         }
 
         val newText = prevContent.text + "\n" + text
-        TelegramBridge.INSTANCE.bot.editMessageText(
+        bot.editMessageText(
             chat.chatId,
             lastMessage.id,
             newText.text,
@@ -147,6 +152,7 @@ class MessageContentMergeableText(
             lastMessage.id,
             currDate,
             MessageContentMergeableText(newText),
+            bot,
         )
     }
 }
@@ -155,8 +161,8 @@ class MessageContentLeave(
     val player: ITgbridgePlayer,
     val text: String,
 ) : MessageContent() {
-    override suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?): TgbridgeTgMessage {
-        val tgMessage = TelegramBridge.INSTANCE.bot.sendMessage(
+    override suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?, bot: TelegramBot): TgbridgeTgMessage {
+        val tgMessage = bot.sendMessage(
             chat.chatId,
             text,
             parseMode = "HTML",
@@ -164,7 +170,7 @@ class MessageContentLeave(
             disableNotification = config.messages.silentEvents.contains(TgMessageType.LEAVE),
         )
         return TgbridgeTgMessage(
-            chat, tgMessage.messageId, Clock.systemUTC().instant(), this
+            chat, tgMessage.messageId, Clock.systemUTC().instant(), this, bot
         )
     }
 }
@@ -173,8 +179,8 @@ class MessageContentJoin(
     val player: ITgbridgePlayer,
     val text: String,
 ) : MessageContent() {
-    private suspend fun sendNewMessage(chat: ChatConfig): TgbridgeTgMessage {
-        val tgMessage = TelegramBridge.INSTANCE.bot.sendMessage(
+    private suspend fun sendNewMessage(chat: ChatConfig, bot: TelegramBot): TgbridgeTgMessage {
+        val tgMessage = bot.sendMessage(
             chat.chatId,
             text,
             parseMode = "HTML",
@@ -182,20 +188,22 @@ class MessageContentJoin(
             disableNotification = config.messages.silentEvents.contains(TgMessageType.JOIN),
         )
         return TgbridgeTgMessage(
-            chat, tgMessage.messageId, Clock.systemUTC().instant(), this
+            chat, tgMessage.messageId, Clock.systemUTC().instant(), this, bot
         )
     }
 
-    override suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?): TgbridgeTgMessage? {
-        val prevContent = (lastMessage?.content as? MessageContentLeave) ?: return sendNewMessage(chat)
+    override suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?, bot: TelegramBot): TgbridgeTgMessage? {
+        val prevContent = (lastMessage?.content as? MessageContentLeave) ?: return sendNewMessage(chat, bot)
         val currDate = Clock.systemUTC().instant()
         if (
             prevContent.player.uuid != player.uuid
+            // the leave message can only be deleted by the bot that sent it
+            || lastMessage.bot !== bot
             || currDate.minus((config.events.leaveJoinMergeWindow).toLong(), ChronoUnit.SECONDS) >= lastMessage.date
         ) {
-            return sendNewMessage(chat)
+            return sendNewMessage(chat, bot)
         }
-        TelegramBridge.INSTANCE.bot.deleteMessage(chat.chatId, lastMessage.id)
+        bot.deleteMessage(chat.chatId, lastMessage.id)
         return null
     }
 }
@@ -205,6 +213,8 @@ class TgbridgeTgMessage(
     val id: Int,
     val date: Instant,
     val content: MessageContent,
+    /** The bot that sent this message; edits/deletes of it must use the same bot. */
+    val bot: TelegramBot,
 )
 
 class ChatManager(private val scope: CoroutineScope) {
@@ -226,7 +236,12 @@ class ChatManager(private val scope: CoroutineScope) {
 
     suspend fun sendMessage(chat: ChatConfig, content: MessageContent) {
         lock.withLock {
-            lastMessages[chat.name] = content.send(chat, lastMessages[chat.name])
+            val lastMessage = lastMessages[chat.name]
+            // Try the main bot, then any reserve bots, honoring Telegram's retry_after only
+            // once every bot is rate limited. Throws (dropping the message) if all give up.
+            lastMessages[chat.name] = withBotFailover(TelegramBridge.INSTANCE.sendBots, TelegramBridge.INSTANCE.logger) { bot ->
+                content.send(chat, lastMessage, bot)
+            }
         }
     }
 

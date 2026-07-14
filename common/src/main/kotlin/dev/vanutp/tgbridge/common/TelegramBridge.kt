@@ -23,6 +23,9 @@ abstract class TelegramBridge {
     abstract val logger: ILogger
     abstract val platform: IPlatform
     lateinit var bot: TelegramBot private set
+    private var reserveBots: List<TelegramBot> = emptyList()
+    /** Main bot first, then reserves; used for rate-limit failover when sending. */
+    val sendBots: List<TelegramBot> get() = listOf(bot) + reserveBots
     private var spark: SparkHelper? = null
 
     private var initialized = false
@@ -80,6 +83,18 @@ abstract class TelegramBridge {
         val initLambda = suspend {
             bot.init()
             logger.info("Logged in as @${bot.me.username}")
+            reserveBots = config.advanced.reserveBotTokens.mapNotNull { token ->
+                try {
+                    TelegramBot(config.advanced.botApiUrl, token, logger, coroutineScope).also {
+                        // validate the token & log in; reserves only send, they don't poll
+                        it.init()
+                        logger.info("Reserve bot logged in as @${it.me.username}")
+                    }
+                } catch (e: Exception) {
+                    logger.error("Failed to initialize a reserve bot, it will be skipped", e)
+                    null
+                }
+            }
             registerTelegramHandlers()
             bot.startPolling()
             initialized = true
@@ -155,6 +170,7 @@ abstract class TelegramBridge {
                 )
             }
             bot.shutdown()
+            reserveBots.forEach { it.shutdown() }
         }
         coroutineScope.cancel()
     }

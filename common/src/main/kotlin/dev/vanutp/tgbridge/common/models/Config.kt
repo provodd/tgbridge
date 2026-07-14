@@ -204,6 +204,16 @@ data class AdvancedConfig(
     val botApiUrl: String = "https://api.telegram.org",
     val proxy: AdvancedProxyConfig = AdvancedProxyConfig(),
     val connectionRetry: AdvancedConnectionRetryConfig = AdvancedConnectionRetryConfig(),
+    @YamlComment(
+        "Reserve (backup) bot tokens for rate-limit failover.",
+        "When the main bot hits Telegram's rate limit (HTTP 429), an outgoing message that",
+        "would otherwise be dropped is sent via a reserve bot instead, under its own separate",
+        "rate limit. Reserve bots only send -- incoming Telegram messages are handled by the",
+        "main bot only, and merging resets when a reserve takes over. Add every reserve bot to",
+        "the same chat(s) as the main bot (with permission to post).",
+        "Default value: [] (disabled)",
+    )
+    val reserveBotTokens: List<String> = emptyList(),
 )
 
 @Serializable

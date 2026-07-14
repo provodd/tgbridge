@@ -46,8 +46,8 @@ class MessageContentVoice(
     val oggData: ByteArray,
     val text: TelegramFormattedText,
 ) : MessageContent() {
-    override suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?): TgbridgeTgMessage {
-        val tgMessage = TelegramBridge.INSTANCE.bot.sendVoice(
+    override suspend fun send(chat: ChatConfig, lastMessage: TgbridgeTgMessage?, bot: TelegramBot): TgbridgeTgMessage {
+        val tgMessage = bot.sendVoice(
             chat.chatId,
             oggData,
             text.text,
@@ -56,7 +56,7 @@ class MessageContentVoice(
             null,
         )
         return TgbridgeTgMessage(
-            chat, tgMessage.messageId, Clock.systemUTC().instant(), this
+            chat, tgMessage.messageId, Clock.systemUTC().instant(), this, bot
         )
     }
 }

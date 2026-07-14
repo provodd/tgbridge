@@ -1,6 +1,6 @@
 ### Unreleased
 
-- honor Telegram's `retry_after` on HTTP 429 (rate limit) responses instead of dropping the message, capped at a few retries so a persistently rate-limited bot fails the request instead of retrying forever
+- add `advanced.reserveBotTokens`: reserve (backup) bots for rate-limit failover. When the main bot hits Telegram's rate limit (HTTP 429), an outgoing message is sent via a reserve bot under its own separate limit instead of being delayed/dropped. Only when every bot is rate limited is Telegram's `retry_after` waited out (capped, after which the message is dropped rather than retried forever)
 
 ### 0.9.10
 

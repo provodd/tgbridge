@@ -55,9 +55,9 @@ class TelegramRateLimitTest {
     }
 
     @Test
-    fun transient429IsRetriedThenSucceeds() = runBlocking {
+    fun singleBotTransient429IsRetriedThenSucceeds() = runBlocking {
         var calls = 0
-        val result = withRetry(logger = NoopLogger(), retryExceptions = emptySet()) {
+        val result = withBotFailover(listOf("main"), NoopLogger()) { _ ->
             calls++
             // retry_after = 0 keeps the test fast (only the ~1s margin is waited)
             if (calls < 3) throw rateLimitException(retryAfter = 0)
@@ -68,19 +68,59 @@ class TelegramRateLimitTest {
     }
 
     @Test
-    fun persistent429IsCappedThenGivesUp() = runBlocking {
+    fun singleBotPersistent429IsCappedThenGivesUp() = runBlocking {
         var calls = 0
         val thrown = assertFailsWith<TelegramException> {
-            // A high connection-retry budget must NOT keep a persistent rate limit
-            // alive: the rate-limit cap is what must stop it.
-            withRetry(logger = NoopLogger(), maxAttempts = 100, retryExceptions = emptySet()) {
+            withBotFailover(listOf("main"), NoopLogger()) { _ ->
                 calls++
                 throw rateLimitException(retryAfter = 0)
             }
         }
         assertEquals(429, thrown.errorCode)
-        // 1 initial attempt + MAX_RATE_LIMIT_RETRIES retries, then it gives up
+        // 1 initial round + MAX_RATE_LIMIT_RETRIES retry rounds, then it gives up
         assertEquals(1 + MAX_RATE_LIMIT_RETRIES, calls)
+    }
+
+    @Test
+    fun failsOverToReserveBotWithoutWaiting() = runBlocking {
+        val used = mutableListOf<String>()
+        val result = withBotFailover(listOf("main", "reserve"), NoopLogger()) { bot ->
+            used += bot
+            // A big retry_after would make the test hang for 30s if failover wrongly
+            // waited on the main bot instead of trying the reserve immediately.
+            if (bot == "main") throw rateLimitException(retryAfter = 30)
+            "sent via $bot"
+        }
+        assertEquals("sent via reserve", result)
+        assertEquals(listOf("main", "reserve"), used)
+    }
+
+    @Test
+    fun allBotsRateLimitedGivesUp() = runBlocking {
+        var calls = 0
+        val thrown = assertFailsWith<TelegramException> {
+            withBotFailover(listOf("main", "reserve"), NoopLogger()) { _ ->
+                calls++
+                throw rateLimitException(retryAfter = 0)
+            }
+        }
+        assertEquals(429, thrown.errorCode)
+        // every round tries both bots before waiting; (1 + cap) rounds
+        assertEquals((1 + MAX_RATE_LIMIT_RETRIES) * 2, calls)
+    }
+
+    @Test
+    fun nonRateLimitErrorPropagatesImmediately() = runBlocking {
+        var calls = 0
+        val thrown = assertFailsWith<TelegramException> {
+            withBotFailover(listOf("main", "reserve"), NoopLogger()) { _ ->
+                calls++
+                throw TelegramException(errorCode = 400, description = "Bad Request")
+            }
+        }
+        assertEquals(400, thrown.errorCode)
+        // not a rate limit: no failover, no retry
+        assertEquals(1, calls)
     }
 
     @Test
